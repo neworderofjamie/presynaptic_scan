@@ -346,7 +346,7 @@ int main(int argc, char *argv[])
     try
     {
         constexpr unsigned int popSize = 5000;
-        constexpr unsigned int numSpikes = 500;
+        constexpr unsigned int numSpikes = 10;
         constexpr unsigned int blockSize = 32;
 
         constexpr unsigned int paddedPopSize = ((popSize + blockSize - 1) / blockSize) * blockSize;
@@ -482,7 +482,7 @@ int main(int argc, char *argv[])
             dim3 threads(paddedGroupSize, 1);
             dim3 grid(1, 1);
             CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
-            treeScanWarpShuffle<64, blockSize, true> << <grid, threads >> > ();
+            treeScanWarpShuffle<paddedGroupSize, blockSize, true> << <grid, threads >> > ();
             CHECK_CUDA_ERRORS(cudaEventRecord(updateEnd));
             CHECK_CUDA_ERRORS(cudaEventSynchronize(updateEnd));
             float time;
