@@ -56,7 +56,7 @@ MergedPresynapticUpdateGroup mergedGroups[NUM_POPULATIONS];
 __device__ unsigned int d_mergedGroupStartID[NUM_POPULATIONS];
 __device__ __constant__  MergedPresynapticUpdateGroup d_mergedGroups[NUM_POPULATIONS];
 
-__global__ void presynapticUpdateIdleThreads()
+__global__ void presynapticUpdate()
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
 
@@ -81,6 +81,102 @@ __global__ void presynapticUpdateIdleThreads()
     }
 }
 
+template<unsigned int B, unsigned P>
+__global__ void treeScan()
+{
+    __shared__ unsigned int shIntermediate[B];
+
+    // Copy padded spike counts into shared memory
+    if(threadIdx.x < NUM_POPULATIONS) {
+        shIntermediate[threadIdx.x] = ((d_mergedGroups[threadIdx.x].srcSpkCnt[0] + P - 1) / P) * P;  
+    }
+    
+    // Perform tree scan
+    for(unsigned int d = 1; d < B; d<<=1) {
+        __syncthreads();
+        const float temp = (threadIdx.x >= d) ? shIntermediate[threadIdx.x - d] : 0;
+        __syncthreads();
+        shIntermediate[threadIdx.x] += temp;
+    }
+
+     __syncthreads();
+
+    // Copy back to global memory    
+    if(threadIdx.x == 0) {
+        d_mergedGroupStartID[0] = 0;
+    }
+    else if(threadIdx.x < NUM_POPULATIONS) {       
+        d_mergedGroupStartID[threadIdx.x] = shIntermediate[threadIdx.x - 1];
+    }
+    
+    if(threadIdx.x == (NUM_POPULATIONS - 1)) {
+        dim3 threads(P, 1);
+        dim3 grid(shIntermediate[threadIdx.x] / P, 1);
+        presynapticUpdate<<<grid, threads>>>();
+    }
+}
+
+template<unsigned int B>
+__global__ void matrixScanSM()
+{
+    // **TODO** prevent bank conflicts
+    __shared__ unsigned int shMatrix[B][B];
+    __shared__ unsigned int shIntermediate[B];
+
+    // 1) Row reduce
+    // Loop through columns
+    // **NOTE** because spike counts are accessed indirectly, no particular point in an additional stage to try and read coalesced
+    {
+        unsigned int sum = 0;
+        unsigned int idx = threadIdx.x * B;
+        for(unsigned int j = 0; j < B; j++) {
+            // If there is a population here
+            if(idx < NUM_POPULATIONS) {
+                // Read spike count, write to shared memory array and add to sum
+                const unsigned int spikeCount = d_mergedGroups[idx].srcSpkCnt[0];
+                shMatrix[threadIdx.x][j] = spikeCount;
+                sum += spikeCount;
+            }
+            idx++;
+        }
+
+        printf("Row sum %u = %u\n", threadIdx.x, sum);
+        // Copy sum to shared memory array
+        shIntermediate[threadIdx.x] = sum;
+    }
+    __syncthreads();
+
+    // 2) Column scan
+    // **TODO** parallel scan
+    {
+        if(threadIdx.x == 0) {
+            unsigned int scan = 0;
+            for(unsigned int j = 0; j < B; j++) {
+                const unsigned int element = shIntermediate[j];
+                shIntermediate[j] = scan;
+                scan += element;
+            }
+        }
+    }
+    __syncthreads();
+    // 3) Row scan
+    {
+        unsigned int scan = shIntermediate[threadIdx.x];
+        unsigned int idx = threadIdx.x * B;
+        for(unsigned int j = 0; j < B; j++) {
+            // If there is a population here
+            if(idx < NUM_POPULATIONS) {
+                // Write start ID back to global memory
+                // **NOTE** HERE coalescing would be worthwhile
+                d_mergedGroupStartID[idx] = scan;
+
+                // Add this matrix element to scan
+                scan += shMatrix[threadIdx.x][j];
+            }
+            idx++;
+        }
+    }
+}
 
 //-----------------------------------------------------------------------------
 // Host functions
@@ -114,12 +210,12 @@ void deviceToHostCopy(HostDeviceArray<T> &array, size_t count)
 //-----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
-    const unsigned int popSize = 5000;
-    const unsigned int numSpikes = 500;
-    const unsigned int blockSize = 32;
-    const bool oracle = true;
+    constexpr unsigned int popSize = 5000;
+    constexpr unsigned int numSpikes = 10;
+    constexpr unsigned int blockSize = 32;
+    constexpr bool oracle = true;
 
-    const unsigned int paddedPopSize = ((popSize + blockSize - 1) / blockSize) * blockSize;
+    constexpr unsigned int paddedPopSize = ((popSize + blockSize - 1) / blockSize) * blockSize;
     std::cout << "Padded pop size:" << paddedPopSize << std::endl;
 
     CHECK_CUDA_ERRORS(cudaSetDevice(0));
@@ -184,22 +280,34 @@ int main(int argc, char *argv[])
     }
 
     // Copy merged group structures to symbols
-    CHECK_CUDA_ERRORS(cudaMemcpyToSymbolAsync(d_mergedGroups, &mergedGroups[0], sizeof(MergedPresynapticUpdateGroup) * NUM_POPULATIONS));
+    CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroups, &mergedGroups[0], sizeof(MergedPresynapticUpdateGroup) * NUM_POPULATIONS));
+    
+    {
+        dim3 threads(64, 1);
+        dim3 grid(1, 1);
+        CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
+        treeScan<64, blockSize><<<grid, threads>>>();
+        CHECK_CUDA_ERRORS(cudaEventRecord(updateEnd));
+        CHECK_CUDA_ERRORS(cudaEventSynchronize(updateEnd));
+        float time;
+        CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
+        std::cout << "Tree scan:" << time << std::endl;
+    }
+    /*
     CHECK_CUDA_ERRORS(cudaMemcpyToSymbolAsync(d_mergedGroupStartID, &mergedGroupStartID[0], sizeof(unsigned int) * NUM_POPULATIONS));
-
     {
         const unsigned int numBlocks = oracle ? (startThread / blockSize) : ((paddedPopSize / blockSize) * NUM_POPULATIONS);
         dim3 threads(blockSize, 1);
         dim3 grid(numBlocks, 1);
 
         CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
-        presynapticUpdateIdleThreads<<<grid, threads>>>();
+        presynapticUpdate<<<grid, threads>>>();
         CHECK_CUDA_ERRORS(cudaEventRecord(updateEnd));
         CHECK_CUDA_ERRORS(cudaEventSynchronize(updateEnd));
         float time;
         CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
         std::cout << "Idle threads:" << time << std::endl;
-    }
+    }*/
 
     for(unsigned int i = 0; i < NUM_POPULATIONS; i++) {
         deviceToHostCopy(inSyn[i], popSize);
