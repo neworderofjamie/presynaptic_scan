@@ -27,8 +27,10 @@
 #define POP_WIDTH 8
 #define POP_HEIGHT 8
 #define POP_CHANNELS 256
+#define POP_SIZE POP_WIDTH * POP_HEIGHT * POP_CHANNELS
 #define KERNEL_SIZE 3
 #define BLOCK_IDX_COUNT 8192
+#define NUM_BATCHES 100
 #define SEED 124
 
 #define CHECK_CUDA_ERRORS(call) {                                                                   \
@@ -69,14 +71,16 @@ __device__ __constant__ unsigned int d_mergedGroupBlockIdx[BLOCK_IDX_COUNT];
 __global__ void presynapticUpdateBlockIdx()
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
-
+    const unsigned int batch = blockIdx.y;
+    const unsigned int batchOffset = batch * POP_SIZE;
+    
     const unsigned int groupID = d_mergedGroupBlockIdx[blockIdx.x];
     struct MergedPresynapticUpdateGroup *group = &d_mergedGroups[groupID];
     const unsigned int groupStartID = d_mergedGroupStartID[groupID];
     const unsigned int lid = id - groupStartID;
 
-    if(lid < group->srcSpkCnt[0]) {
-        const unsigned int preInd = group->srcSpk[lid];
+    if(lid < group->srcSpkCnt[batch]) {
+        const unsigned int preInd = group->srcSpk[batchOffset + lid];
 
         // Stash all parameters in registers
         // **NOTE** this means parameters from group structure only get converted from float->int once
@@ -111,7 +115,7 @@ __global__ void presynapticUpdateBlockIdx()
                                         (outCol * conv_oc) +
                                         outChan);
                     const unsigned int kernelInd = (kernRow * KERNEL_SIZE * POP_CHANNELS * POP_CHANNELS) + (kernCol * POP_CHANNELS * POP_CHANNELS) + (inChan * POP_CHANNELS) + (outChan);
-                    atomicAdd(&group->inSyn[idPost], group->kernelg[kernelInd]);
+                    atomicAdd(&group->inSyn[batchOffset + idPost], group->kernelg[kernelInd]);
                 }
             }
         }
@@ -123,7 +127,9 @@ __global__ void presynapticUpdateBlockIdx()
 __global__ void presynapticUpdate()
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
-
+    const unsigned int batch = blockIdx.y;
+    const unsigned int batchOffset = batch * POP_SIZE;
+    
     unsigned int lo = 0;
     unsigned int hi = NUM_POPULATIONS;
     while(lo < hi) {
@@ -139,8 +145,8 @@ __global__ void presynapticUpdate()
     const unsigned int groupStartID = d_mergedGroupStartID[lo - 1];
     const unsigned int lid = id - groupStartID;
 
-    if(lid < group->srcSpkCnt[0]) {
-        const unsigned int preInd = group->srcSpk[lid];
+    if(lid < group->srcSpkCnt[batch]) {
+        const unsigned int preInd = group->srcSpk[batchOffset + lid];
         // Stash all parameters in registers
         // **NOTE** this means parameters from group structure only get converted from float->int once
         // **NOTE** if they're actually constant, compiler is still likely to treat them as constants rather than allocating registers
@@ -174,7 +180,7 @@ __global__ void presynapticUpdate()
                                         (outCol * conv_oc) +
                                         outChan);
                     const unsigned int kernelInd = (kernRow * 3 * POP_CHANNELS * POP_CHANNELS) + (kernCol * POP_CHANNELS * POP_CHANNELS) + (inChan * POP_CHANNELS) + (outChan);
-                    atomicAdd(&group->inSyn[idPost], group->kernelg[kernelInd]);
+                    atomicAdd(&group->inSyn[batchOffset + idPost], group->kernelg[kernelInd]);
                 }
             }
         }
@@ -185,7 +191,9 @@ __global__ void presynapticUpdate()
  __global__ void presynapticUpdateMax()
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
-
+    const unsigned int batch = blockIdx.y;
+    const unsigned int batchOffset = batch * POP_SIZE;
+    
     if(id < d_max) {
         unsigned int lo = 0;
         unsigned int hi = NUM_POPULATIONS;
@@ -202,8 +210,8 @@ __global__ void presynapticUpdate()
         const unsigned int groupStartID = d_mergedGroupStartID[lo - 1];
         const unsigned int lid = id - groupStartID;
 
-        if(lid < group->srcSpkCnt[0]) {
-            const unsigned int preInd = group->srcSpk[lid];
+        if(lid < group->srcSpkCnt[batch]) {
+            const unsigned int preInd = group->srcSpk[batchOffset + lid];
             // Stash all parameters in registers
             // **NOTE** this means parameters from group structure only get converted from float->int once
             // **NOTE** if they're actually constant, compiler is still likely to treat them as constants rather than allocating registers
@@ -237,7 +245,7 @@ __global__ void presynapticUpdate()
                                             (outCol * conv_oc) +
                                             outChan);
                         const unsigned int kernelInd = (kernRow * 3 * POP_CHANNELS * POP_CHANNELS) + (kernCol * POP_CHANNELS * POP_CHANNELS) + (inChan * POP_CHANNELS) + (outChan);
-                        atomicAdd(&group->inSyn[idPost], group->kernelg[kernelInd]);
+                        atomicAdd(&group->inSyn[batchOffset + idPost], group->kernelg[kernelInd]);
                     }
                 }
             }
@@ -277,7 +285,7 @@ __global__ void treeScan()
     if(threadIdx.x == (NUM_POPULATIONS - 1)) {
         if(dynamic) {
             dim3 threads(P, 1);
-            dim3 grid(shIntermediate[threadIdx.x] / P, 1);
+            dim3 grid(shIntermediate[threadIdx.x] / P, NUM_BATCHES);
             presynapticUpdate<<<grid, threads>>>();
         }
         else {
@@ -347,7 +355,7 @@ __global__ void treeScanWarpShuffle()
     if(threadIdx.x == (NUM_POPULATIONS - 1)) {
         if(dynamic) {
             dim3 threads(P, 1);
-            dim3 grid(paddedNumSpikes / P, 1);
+            dim3 grid(paddedNumSpikes / P, NUM_BATCHES);
             presynapticUpdate<<<grid, threads>>>();
         }
         else {
@@ -467,10 +475,10 @@ void zeroISyn(HostDeviceArray<float> (&inSyn)[NUM_POPULATIONS], unsigned int pop
 {
     for(unsigned int i = 0; i < NUM_POPULATIONS; i++) {
         // Zero host inSyn
-        std::fill_n(&inSyn[i].first[0], popSize, 0.0f);
+        std::fill_n(&inSyn[i].first[0], popSize * NUM_BATCHES, 0.0f);
 
         // Copy to device
-        hostToDeviceCopy(inSyn[i], popSize);
+        hostToDeviceCopy(inSyn[i], popSize * NUM_BATCHES);
     }
 }
 //-----------------------------------------------------------------------------
@@ -507,15 +515,16 @@ int main(int argc, char *argv[])
             correctInSyn[i].resize(popSize, 0.0f);
 
             // Allocate memory
-            inSyn[i] = allocateHostDevice<float>(popSize);
-            auto srcSpkCnt = allocateHostDevice<unsigned int>(1);
-            auto srcSpk = allocateHostDevice<unsigned int>(popSize);
+            inSyn[i] = allocateHostDevice<float>(popSize * NUM_BATCHES);
+            auto srcSpkCnt = allocateHostDevice<unsigned int>(NUM_BATCHES);
+            auto srcSpk = allocateHostDevice<unsigned int>(popSize * NUM_BATCHES);
             auto kernelG = allocateHostDevice<float>(POP_CHANNELS * POP_CHANNELS * KERNEL_SIZE * KERNEL_SIZE);
 
             // Generate random spikes
-            srcSpkCnt.first[0] = numSpikes;
-            std::generate_n(&srcSpk.first[0], numSpikes, [&rng, &spikeDist]() { return spikeDist(rng); });
-
+            for(unsigned int b = 0; b < NUM_BATCHES; b++) {
+                srcSpkCnt.first[b] = numSpikes;
+                std::generate_n(&srcSpk.first[b * popSize], numSpikes, [&rng, &spikeDist]() { return spikeDist(rng); });
+            }
             // Generate weights
             std::generate_n(&kernelG.first[0], POP_CHANNELS * POP_CHANNELS * KERNEL_SIZE * KERNEL_SIZE, 
                             [&rng, &weightDist]() { return weightDist(rng); });
@@ -527,8 +536,8 @@ int main(int argc, char *argv[])
             }*/
 
             // Upload
-            hostToDeviceCopy(srcSpkCnt, 1, true);
-            hostToDeviceCopy(srcSpk, popSize, true);
+            hostToDeviceCopy(srcSpkCnt, NUM_BATCHES, true);
+            hostToDeviceCopy(srcSpk, popSize * NUM_BATCHES, true);
             hostToDeviceCopy(kernelG, POP_CHANNELS * POP_CHANNELS * KERNEL_SIZE * KERNEL_SIZE, true);
 
             // Build struct with device pointers
@@ -562,7 +571,7 @@ int main(int argc, char *argv[])
 
             const unsigned int numBlocks = (paddedPopSize / blockSize) * NUM_POPULATIONS;
             dim3 presynapticThreads(blockSize, 1);
-            dim3 presynapticGrid(numBlocks, 1);
+            dim3 presynapticGrid(numBlocks, NUM_BATCHES);
             dim3 threads(paddedGroupSize, 1);
             dim3 grid(1, 1);
             CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
@@ -583,7 +592,7 @@ int main(int argc, char *argv[])
 
             const unsigned int numBlocks = (paddedPopSize / blockSize) * NUM_POPULATIONS;
             dim3 presynapticThreads(blockSize, 1);
-            dim3 presynapticGrid(numBlocks, 1);
+            dim3 presynapticGrid(numBlocks, NUM_BATCHES);
 
             dim3 threads(paddedGroupSize, 1);
             dim3 grid(1, 1);
@@ -642,7 +651,7 @@ int main(int argc, char *argv[])
 
             const unsigned int numBlocks = startThread / blockSize;
             dim3 threads(blockSize, 1);
-            dim3 grid(numBlocks, 1);
+            dim3 grid(numBlocks, NUM_BATCHES);
 
             CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
             presynapticUpdate << <grid, threads >> > ();
@@ -664,7 +673,7 @@ int main(int argc, char *argv[])
 
             const unsigned int numBlocks = (paddedPopSize / blockSize) * NUM_POPULATIONS;
             dim3 threads(blockSize, 1);
-            dim3 grid(numBlocks, 1);
+            dim3 grid(numBlocks, NUM_BATCHES);
 
             CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
             presynapticUpdate << <grid, threads >> > ();
@@ -686,7 +695,7 @@ int main(int argc, char *argv[])
 
             const unsigned int numBlocks =  (paddedPopSize / blockSize) * NUM_POPULATIONS;
             dim3 threads(blockSize, 1);
-            dim3 grid(numBlocks, 1);
+            dim3 grid(numBlocks, NUM_BATCHES);
 
             CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
             presynapticUpdateBlockIdx << <grid, threads >> > ();
