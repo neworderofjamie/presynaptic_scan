@@ -24,7 +24,7 @@
 // Macros
 //------------------------------------------------------------------------
 #define NUM_POPULATIONS 50
-#define BLOCK_IDX_COUNT 4143
+#define BLOCK_IDX_COUNT 8272
 #define SEED 124
 
 #define CHECK_CUDA_ERRORS(call) {                                                                   \
@@ -380,7 +380,7 @@ int main(int argc, char *argv[])
     std::fill(std::begin(numSpikes), std::end(numSpikes), 5000);*/
     
     
-    constexpr unsigned int blockSize = 64;
+    constexpr unsigned int blockSize = 32;
     
     try
     {
@@ -455,8 +455,9 @@ int main(int argc, char *argv[])
             startThread += ((numSpikes[i] + blockSize - 1) / blockSize) * blockSize;
             overallocatedStartThread += paddedPopSizes[i];
         }
-        assert(BLOCK_IDX_COUNT == (overallocatedStartThread / blockSize));
         std::cout << "Optimal number of threads:" << startThread << ", Overallocated number of threads:" << overallocatedStartThread << std::endl;
+        assert(BLOCK_IDX_COUNT == (overallocatedStartThread / blockSize));
+        
 
         // Copy merged group structures to symbols
         CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroups, &mergedGroups[0], sizeof(MergedPresynapticUpdateGroup) * NUM_POPULATIONS));
