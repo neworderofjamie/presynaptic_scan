@@ -23,7 +23,8 @@
 //------------------------------------------------------------------------
 // Macros
 //------------------------------------------------------------------------
-#define NUM_POPULATIONS 17
+#define NUM_POPULATIONS 50
+#define BLOCK_IDX_COUNT 4143
 #define SEED 124
 
 #define CHECK_CUDA_ERRORS(call) {                                                                   \
@@ -51,14 +52,33 @@ struct MergedPresynapticUpdateGroup
 // Host globals
 unsigned int oracleMergedGroupStartID[NUM_POPULATIONS];
 unsigned int overallocateMergedGroupStartID[NUM_POPULATIONS];
+unsigned int mergedGroupBlockIdx[BLOCK_IDX_COUNT];
 MergedPresynapticUpdateGroup mergedGroups[NUM_POPULATIONS];
 
 // Device globals
 __device__ unsigned int d_max;
 __device__ unsigned int d_mergedGroupStartID[NUM_POPULATIONS];
-__device__ __constant__  MergedPresynapticUpdateGroup d_mergedGroups[NUM_POPULATIONS];
+__device__ __constant__ MergedPresynapticUpdateGroup d_mergedGroups[NUM_POPULATIONS];
+__device__ __constant__ unsigned int d_mergedGroupBlockIdx[BLOCK_IDX_COUNT];
 
-// Presynaptic update kernel which assumes grid is correct size
+// Presynaptic update kernel which assumes merged group start ids cover entire grid
+__global__ void presynapticUpdateBlockIdx()
+{
+    const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
+
+    const unsigned int groupID = d_mergedGroupBlockIdx[blockIdx.x];
+    struct MergedPresynapticUpdateGroup *group = &d_mergedGroups[groupID];
+    const unsigned int groupStartID = d_mergedGroupStartID[groupID];
+    const unsigned int lid = id - groupStartID;
+
+    if(lid < group->srcSpkCnt[0]) {
+        const unsigned int preInd = group->srcSpk[lid];
+        atomicAdd(&group->inSyn[preInd], group->weight[preInd]);
+    }
+}
+
+
+// Presynaptic update kernel which assumes merged group start ids cover entire grid
 __global__ void presynapticUpdate()
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
@@ -354,7 +374,13 @@ int main(int argc, char *argv[])
                                                         10};
     constexpr unsigned int numSpikes[NUM_POPULATIONS] = {500, 9600, 3700, 2600, 1200, 990, 770, 600, 
                                                          300, 790, 670, 260, 430, 230, 560, 750, 5};
-    constexpr unsigned int blockSize = 32;
+    /*unsigned int popSizes[NUM_POPULATIONS];
+    unsigned int numSpikes[NUM_POPULATIONS];
+    std::fill(std::begin(popSizes), std::end(popSizes), 50000);
+    std::fill(std::begin(numSpikes), std::end(numSpikes), 5000);*/
+    
+    
+    constexpr unsigned int blockSize = 64;
     
     try
     {
@@ -418,6 +444,9 @@ int main(int argc, char *argv[])
             mergedGroups[i].srcSpkCnt = srcSpkCnt.second;
             mergedGroups[i].weight = weight.second;
 
+            // Populate block IDs
+            std::fill(&mergedGroupBlockIdx[overallocatedStartThread / blockSize], &mergedGroupBlockIdx[(overallocatedStartThread + paddedPopSizes[i]) / blockSize], i);
+
             // Calculate static start ID
             oracleMergedGroupStartID[i] = startThread;
             overallocateMergedGroupStartID[i] = overallocatedStartThread;
@@ -426,10 +455,13 @@ int main(int argc, char *argv[])
             startThread += ((numSpikes[i] + blockSize - 1) / blockSize) * blockSize;
             overallocatedStartThread += paddedPopSizes[i];
         }
+        assert(BLOCK_IDX_COUNT == (overallocatedStartThread / blockSize));
+        std::cout << "Optimal number of threads:" << startThread << ", Overallocated number of threads:" << overallocatedStartThread << std::endl;
 
         // Copy merged group structures to symbols
         CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroups, &mergedGroups[0], sizeof(MergedPresynapticUpdateGroup) * NUM_POPULATIONS));
-
+        CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupBlockIdx, &mergedGroupBlockIdx[0], sizeof(unsigned int) * BLOCK_IDX_COUNT));
+        
         // Naive tree-scan with host overallocated kernel launch
         {
             // Zero ISyn
@@ -548,6 +580,28 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Overallocated:" << time << std::endl;
+            checkOutput(correctInSyn, inSyn, popSizes);
+        }
+        
+        // Update block IDX version
+        {
+            // Copy overallocated group start IDs
+            CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupStartID, &overallocateMergedGroupStartID[0], sizeof(unsigned int) * NUM_POPULATIONS));
+
+            // Zero ISyn
+            zeroISyn(inSyn, popSizes);
+
+            const unsigned int numBlocks = overallocatedStartThread / blockSize;
+            dim3 threads(blockSize, 1);
+            dim3 grid(numBlocks, 1);
+
+            CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
+            presynapticUpdateBlockIdx << <grid, threads >> > ();
+            CHECK_CUDA_ERRORS(cudaEventRecord(updateEnd));
+            CHECK_CUDA_ERRORS(cudaEventSynchronize(updateEnd));
+            float time;
+            CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
+            std::cout << "Block IDX:" << time << std::endl;
             checkOutput(correctInSyn, inSyn, popSizes);
         }
     }
