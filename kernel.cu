@@ -23,7 +23,7 @@
 //------------------------------------------------------------------------
 // Macros
 //------------------------------------------------------------------------
-#define NUM_POPULATIONS 1000
+#define NUM_POPULATIONS 17
 #define SEED 124
 
 #define CHECK_CUDA_ERRORS(call) {                                                                   \
@@ -316,12 +316,12 @@ void deviceToHostCopy(HostDeviceArray<T> &array, size_t count)
 }
 //-----------------------------------------------------------------------------
 void checkOutput(const std::vector<float> (&correctInSyn)[NUM_POPULATIONS],
-                 HostDeviceArray<float> (&inSyn)[NUM_POPULATIONS], unsigned int popSize)
+                 HostDeviceArray<float> (&inSyn)[NUM_POPULATIONS], const unsigned int (&popSizes)[NUM_POPULATIONS])
 {
      for(unsigned int i = 0; i < NUM_POPULATIONS; i++) {
-        deviceToHostCopy(inSyn[i], popSize);
+        deviceToHostCopy(inSyn[i], popSizes[i]);
 
-        for(unsigned int j = 0; j < popSize; j++) {
+        for(unsigned int j = 0; j < popSizes[i]; j++) {
             if(std::fabs(inSyn[i].first[j] - correctInSyn[i][j]) > 0.0001f) {
                 std::cerr << "\tFailed" << std::endl;
                 return;
@@ -330,26 +330,38 @@ void checkOutput(const std::vector<float> (&correctInSyn)[NUM_POPULATIONS],
     }
 }
 //----------------------------------------------------------------------------
-void zeroISyn(HostDeviceArray<float> (&inSyn)[NUM_POPULATIONS], unsigned int popSize)
+void zeroISyn(HostDeviceArray<float> (&inSyn)[NUM_POPULATIONS], const unsigned int (&popSizes)[NUM_POPULATIONS])
 {
     for(unsigned int i = 0; i < NUM_POPULATIONS; i++) {
         // Zero host inSyn
-        std::fill_n(&inSyn[i].first[0], popSize, 0.0f);
+        std::fill_n(&inSyn[i].first[0], popSizes[i], 0.0f);
 
         // Copy to device
-        hostToDeviceCopy(inSyn[i], popSize);
+        hostToDeviceCopy(inSyn[i], popSizes[i]);
     }
 }
 //-----------------------------------------------------------------------------
 int main(int argc, char *argv[])
 {
+    // Population sizes and number of spikes
+    constexpr unsigned int popSizes[NUM_POPULATIONS] = {3000, 
+                                                        60000, 60000, 
+                                                        30000, 30000, 
+                                                        15000, 15000, 15000, 
+                                                        7500, 7500, 7500,
+                                                        2000, 2000, 2000,
+                                                        4000, 4000,
+                                                        10};
+    constexpr unsigned int numSpikes[NUM_POPULATIONS] = {500, 9600, 3700, 2600, 1200, 990, 770, 600, 
+                                                         300, 790, 670, 260, 430, 230, 560, 750, 5};
+    constexpr unsigned int blockSize = 32;
+    
     try
     {
-        constexpr unsigned int popSize = 5000;
-        constexpr unsigned int numSpikes = 10;
-        constexpr unsigned int blockSize = 32;
-
-        constexpr unsigned int paddedPopSize = ((popSize + blockSize - 1) / blockSize) * blockSize;
+        // Pad population sizes
+        unsigned int paddedPopSizes[NUM_POPULATIONS];
+        std::transform(std::begin(popSizes), std::end(popSizes), std::begin(paddedPopSizes),
+                       [blockSize](unsigned int popSize){ return ((popSize + blockSize - 1) / blockSize) * blockSize; });
 
         constexpr unsigned int paddedGroupSize = ((NUM_POPULATIONS + 32 - 1) / 32) * 32;
         std::cout << "Padded group size:" << paddedGroupSize << std::endl;
@@ -362,40 +374,43 @@ int main(int argc, char *argv[])
         CHECK_CUDA_ERRORS(cudaEventCreate(&updateEnd));
 
         std::mt19937 rng;
-        std::uniform_int_distribution<unsigned int> spikeDist(0, popSize - 1);
         std::normal_distribution<float> weightDist(0.0f, 0.25f);
 
         HostDeviceArray<float> inSyn[NUM_POPULATIONS];
         std::vector<float> correctInSyn[NUM_POPULATIONS];
 
         unsigned int startThread = 0;
+        unsigned int overallocatedStartThread = 0;
         for(unsigned int i = 0; i < NUM_POPULATIONS; i++) {
             // Resize and zero correct insyn vector
-            correctInSyn[i].resize(popSize, 0.0f);
+            correctInSyn[i].resize(popSizes[i], 0.0f);
 
             // Allocate memory
-            inSyn[i] = allocateHostDevice<float>(popSize);
+            inSyn[i] = allocateHostDevice<float>(popSizes[i]);
             auto srcSpkCnt = allocateHostDevice<unsigned int>(1);
-            auto srcSpk = allocateHostDevice<unsigned int>(popSize);
-            auto weight = allocateHostDevice<float>(popSize);
+            auto srcSpk = allocateHostDevice<unsigned int>(popSizes[i]);
+            auto weight = allocateHostDevice<float>(popSizes[i]);
+
+            // Create distribution of spike IDs
+            std::uniform_int_distribution<unsigned int> spikeDist(0, popSizes[i] - 1);
 
             // Generate random spikes
-            srcSpkCnt.first[0] = numSpikes;
-            std::generate_n(&srcSpk.first[0], numSpikes, [&rng, &spikeDist]() { return spikeDist(rng); });
+            srcSpkCnt.first[0] = numSpikes[i];
+            std::generate_n(&srcSpk.first[0], numSpikes[i], [&rng, &spikeDist]() { return spikeDist(rng); });
 
             // Generate weights
-            std::generate_n(&weight.first[0], popSize, [&rng, &weightDist]() { return weightDist(rng); });
+            std::generate_n(&weight.first[0], popSizes[i], [&rng, &weightDist]() { return weightDist(rng); });
 
             // Calculate correct output
-            for(unsigned int j = 0; j < numSpikes; j++) {
+            for(unsigned int j = 0; j < numSpikes[i]; j++) {
                 const unsigned int ind = srcSpk.first[j];
                 correctInSyn[i][ind] += weight.first[ind];
             }
 
             // Upload
             hostToDeviceCopy(srcSpkCnt, 1, true);
-            hostToDeviceCopy(srcSpk, popSize, true);
-            hostToDeviceCopy(weight, popSize, true);
+            hostToDeviceCopy(srcSpk, popSizes[i], true);
+            hostToDeviceCopy(weight, popSizes[i], true);
 
             // Build struct with device pointers
             mergedGroups[i].inSyn = inSyn[i].second;
@@ -405,10 +420,11 @@ int main(int argc, char *argv[])
 
             // Calculate static start ID
             oracleMergedGroupStartID[i] = startThread;
-            overallocateMergedGroupStartID[i] = (i * paddedPopSize);
+            overallocateMergedGroupStartID[i] = overallocatedStartThread;
 
             // Sum padded spikes
-            startThread += ((numSpikes + blockSize - 1) / blockSize) * blockSize;
+            startThread += ((numSpikes[i] + blockSize - 1) / blockSize) * blockSize;
+            overallocatedStartThread += paddedPopSizes[i];
         }
 
         // Copy merged group structures to symbols
@@ -417,9 +433,9 @@ int main(int argc, char *argv[])
         // Naive tree-scan with host overallocated kernel launch
         {
             // Zero ISyn
-            zeroISyn(inSyn, popSize);
+            zeroISyn(inSyn, popSizes);
 
-            const unsigned int numBlocks = (paddedPopSize / blockSize) * NUM_POPULATIONS;
+            const unsigned int numBlocks = overallocatedStartThread / blockSize;
             dim3 presynapticThreads(blockSize, 1);
             dim3 presynapticGrid(numBlocks, 1);
             dim3 threads(paddedGroupSize, 1);
@@ -432,15 +448,15 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Tree scan host overallocated kernel:" << time << std::endl;
-            checkOutput(correctInSyn, inSyn, popSize);
+            checkOutput(correctInSyn, inSyn, popSizes);
         }
 
         // Warp-shuffle based tree-scan with host overallocated kernel launch
         {
             // Zero ISyn
-            zeroISyn(inSyn, popSize);
+            zeroISyn(inSyn, popSizes);
 
-            const unsigned int numBlocks = (paddedPopSize / blockSize) * NUM_POPULATIONS;
+            const unsigned int numBlocks = overallocatedStartThread / blockSize;
             dim3 presynapticThreads(blockSize, 1);
             dim3 presynapticGrid(numBlocks, 1);
 
@@ -454,13 +470,13 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Tree scan warp shuffle overallocated kernel:" << time << std::endl;
-            checkOutput(correctInSyn, inSyn, popSize);
+            checkOutput(correctInSyn, inSyn, popSizes);
         }
 
         // Naive tree-scan using dynamic parallelism
         {
             // Zero ISyn
-            zeroISyn(inSyn, popSize);
+            zeroISyn(inSyn, popSizes);
 
             dim3 threads(paddedGroupSize, 1);
             dim3 grid(1, 1);
@@ -471,13 +487,13 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Tree scan dynamic parallelism:" << time << std::endl;
-            checkOutput(correctInSyn, inSyn, popSize);
+            checkOutput(correctInSyn, inSyn, popSizes);
         }
 
         // Warp-shuffle based tree-scan using dynamic parallelism
         {
             // Zero ISyn
-            zeroISyn(inSyn, popSize);
+            zeroISyn(inSyn, popSizes);
 
             dim3 threads(paddedGroupSize, 1);
             dim3 grid(1, 1);
@@ -488,7 +504,7 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Tree scan warp shuffle dynamic parallelism:" << time << std::endl;
-            checkOutput(correctInSyn, inSyn, popSize);
+            checkOutput(correctInSyn, inSyn, popSizes);
         }
 
         // Oracle version with perfectly sized groups and kernel
@@ -497,7 +513,7 @@ int main(int argc, char *argv[])
             CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupStartID, &oracleMergedGroupStartID[0], sizeof(unsigned int) * NUM_POPULATIONS));
 
             // Zero ISyn
-            zeroISyn(inSyn, popSize);
+            zeroISyn(inSyn, popSizes);
 
             const unsigned int numBlocks = startThread / blockSize;
             dim3 threads(blockSize, 1);
@@ -510,7 +526,7 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Oracle:" << time << std::endl;
-            checkOutput(correctInSyn, inSyn, popSize);
+            checkOutput(correctInSyn, inSyn, popSizes);
         }
 
         // Overallocated version
@@ -519,9 +535,9 @@ int main(int argc, char *argv[])
             CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupStartID, &overallocateMergedGroupStartID[0], sizeof(unsigned int) * NUM_POPULATIONS));
 
             // Zero ISyn
-            zeroISyn(inSyn, popSize);
+            zeroISyn(inSyn, popSizes);
 
-            const unsigned int numBlocks = (paddedPopSize / blockSize) * NUM_POPULATIONS;
+            const unsigned int numBlocks = overallocatedStartThread / blockSize;
             dim3 threads(blockSize, 1);
             dim3 grid(numBlocks, 1);
 
@@ -532,7 +548,7 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Overallocated:" << time << std::endl;
-            checkOutput(correctInSyn, inSyn, popSize);
+            checkOutput(correctInSyn, inSyn, popSizes);
         }
     }
     catch(std::exception &ex) {
