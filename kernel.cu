@@ -55,17 +55,111 @@ struct MergedPresynapticUpdateGroup
     float *kernelg;
 };
 
+struct MergedPresynapticUpdateGroup2
+{
+    float *inSyn;
+    uint32_t *srcSpk;
+    float *kernelg;
+};
+
 // Host globals
 unsigned int oracleMergedGroupStartID[NUM_POPULATIONS];
 unsigned int overallocateMergedGroupStartID[NUM_POPULATIONS];
 unsigned int mergedGroupBlockIdx[BLOCK_IDX_COUNT];
 MergedPresynapticUpdateGroup mergedGroups[NUM_POPULATIONS];
+MergedPresynapticUpdateGroup2 mergedGroups2[NUM_POPULATIONS];
 
 // Device globals
 //__device__ unsigned int d_max;
 __device__ __constant__ unsigned int d_mergedGroupStartID[NUM_POPULATIONS];
 __device__ __constant__ MergedPresynapticUpdateGroup d_mergedGroups[NUM_POPULATIONS];
+__device__ __constant__ MergedPresynapticUpdateGroup2 d_mergedGroups2[NUM_POPULATIONS];
 __device__ __constant__ unsigned int d_mergedGroupBlockIdx[BLOCK_IDX_COUNT];
+
+__global__ void presynapticUpdateBitmask()
+{
+    const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
+    
+    unsigned int lo = 0;
+    unsigned int hi = NUM_POPULATIONS;
+    while(lo < hi) {
+        const unsigned int mid = (lo + hi) / 2;
+        if(id < d_mergedGroupStartID[mid]) {
+            hi = mid;
+        }
+        else {
+            lo = mid + 1;
+        }
+    }
+    struct MergedPresynapticUpdateGroup2 *group = &d_mergedGroups2[lo - 1];
+    const unsigned int groupStartID = d_mergedGroupStartID[lo - 1];
+    const unsigned int lid = id - groupStartID;
+
+    const unsigned int preInd = lid;
+
+    // Stash all parameters in registers
+    // **NOTE** this means parameters from group structure only get converted from float->int once
+    // **NOTE** if they're actually constant, compiler is still likely to treat them as constants rather than allocating registers
+    const int conv_kh = KERNEL_SIZE, conv_kw = KERNEL_SIZE;
+    const int conv_sh = 1, conv_sw = 1;
+    const int conv_padh = 1, conv_padw = 1;
+    const int conv_iw = POP_WIDTH, conv_ic = POP_CHANNELS;
+    const int conv_ow = POP_WIDTH, conv_oh = POP_WIDTH, conv_oc = POP_CHANNELS;
+
+    // Convert presynaptic neuron ID to row, column and channel in conv input
+    const int inRow = (preInd / conv_ic) / conv_iw;
+    const int inCol = (preInd / conv_ic) % conv_iw;
+    const int inChan = preInd % conv_ic;
+
+    // Calculate range of output rows and columns which this presynaptic neuron connects to
+    const int minOutRow = min(conv_oh, max(0, 1 + ((inRow + conv_padh - conv_kh) / conv_sh)));
+    const int maxOutRow = min(conv_oh, max(0, 1 + ((inRow + conv_padh) / conv_sh)));
+    const int minOutCol = min(conv_ow, max(0, 1 + ((inCol + conv_padw - conv_kw) / conv_sw)));
+    const int maxOutCol = min(conv_ow, max(0, 1 + ((inCol + conv_padw) / conv_sw)));
+
+    // Loop through output rows, columns and channels
+    for(int outRow = minOutRow; outRow != maxOutRow; outRow++) {
+        const int strideRow = (outRow * conv_sh) - conv_padh;
+        const int kernRow = inRow - strideRow;
+        for(int outCol = minOutCol; outCol < maxOutCol; outCol++) {
+            const int strideCol = (outCol * conv_sw) - conv_padw;
+            const int kernCol = inCol - strideCol;
+            for(int outChan = 0; outChan < conv_oc; outChan++) {
+                // Calculate postsynaptic index and add synapse
+                const int idPost = ((outRow * conv_ow * conv_oc) +
+                                    (outCol * conv_oc) +
+                                    outChan);
+                const unsigned int kernelInd = (kernRow * KERNEL_SIZE * POP_CHANNELS * POP_CHANNELS) + (kernCol * POP_CHANNELS * POP_CHANNELS) + (inChan * POP_CHANNELS) + (outChan);
+                const float weight = group->kernelg[kernelInd];
+                for(unsigned int w = 0; w < 4; w++) {
+                    uint32_t spikeWord = group->srcSpk[(preInd * 4) + w];
+
+                    // While there any bits left
+                    unsigned int ibit = 0;
+                    while(spikeWord != 0) {
+                        // Cound leading zeros (as bits are indexed backwards this is index of next synapse)
+                        const int numLZ = __clz(spikeWord);
+
+                        // Shift off zeros and the one just discovered
+                        // **NOTE** if numLZ == 31, undefined behaviour results in C++, BUT in CUDA this PRESUMABLY emits
+                        // In a 'shl' PTX instruction where "Shift amounts greater than the register width N are clamped to N."
+                        spikeWord <<= (numLZ + 1);
+
+                        // Add to bit index
+                        ibit += numLZ;
+
+                        // Calculate spike batch
+                        const unsigned int batch = ibit + (w * 32);
+                        atomicAdd(&group->inSyn[(batch * POP_SIZE) + idPost], weight);
+
+                        ibit++;
+                    }
+
+                }
+            }
+        }
+    }
+}
 
 // Presynaptic update kernel which assumes merged group start ids cover entire grid
 __global__ void presynapticUpdateBlockIdx()
@@ -491,6 +585,7 @@ int main(int argc, char *argv[])
         constexpr unsigned int blockSize = 32;
 
         constexpr unsigned int paddedPopSize = ((popSize + blockSize - 1) / blockSize) * blockSize;
+        constexpr unsigned int batchWords = (NUM_BATCHES + 31) / 32;
 
         constexpr unsigned int paddedGroupSize = ((NUM_POPULATIONS + 32 - 1) / 32) * 32;
         std::cout << "Padded group size:" << paddedGroupSize << std::endl;
@@ -519,11 +614,22 @@ int main(int argc, char *argv[])
             auto srcSpkCnt = allocateHostDevice<unsigned int>(NUM_BATCHES);
             auto srcSpk = allocateHostDevice<unsigned int>(popSize * NUM_BATCHES);
             auto kernelG = allocateHostDevice<float>(POP_CHANNELS * POP_CHANNELS * KERNEL_SIZE * KERNEL_SIZE);
+            auto spikeBitmask = allocateHostDevice<uint32_t>(batchWords * popSize);
 
+            // Zero spike bitmask
+            std::fill_n(&spikeBitmask.first[0], popSize * batchWords, 0);
+            
             // Generate random spikes
             for(unsigned int b = 0; b < NUM_BATCHES; b++) {
                 srcSpkCnt.first[b] = numSpikes;
-                std::generate_n(&srcSpk.first[b * popSize], numSpikes, [&rng, &spikeDist]() { return spikeDist(rng); });
+                
+                for(unsigned int s = 0; s < numSpikes; s++) {
+                    const unsigned int idx = spikeDist(rng);
+
+                    srcSpk.first[(b * popSize) + s] = idx;
+
+                    spikeBitmask.first[(idx * batchWords) + (b / 32)] |= (0x80000000 >> (b % 32));
+                }
             }
             // Generate weights
             std::generate_n(&kernelG.first[0], POP_CHANNELS * POP_CHANNELS * KERNEL_SIZE * KERNEL_SIZE, 
@@ -539,13 +645,18 @@ int main(int argc, char *argv[])
             hostToDeviceCopy(srcSpkCnt, NUM_BATCHES, true);
             hostToDeviceCopy(srcSpk, popSize * NUM_BATCHES, true);
             hostToDeviceCopy(kernelG, POP_CHANNELS * POP_CHANNELS * KERNEL_SIZE * KERNEL_SIZE, true);
-
-            // Build struct with device pointers
+            hostToDeviceCopy(spikeBitmask, batchWords * popSize);
+            
+            // Build structs with device pointers
             mergedGroups[i].inSyn = inSyn[i].second;
             mergedGroups[i].srcSpk = srcSpk.second;
             mergedGroups[i].srcSpkCnt = srcSpkCnt.second;
             mergedGroups[i].kernelg = kernelG.second;
-
+            
+            mergedGroups2[i].inSyn = inSyn[i].second;
+            mergedGroups2[i].kernelg = kernelG.second;
+            mergedGroups2[i].srcSpk = spikeBitmask.second;
+    
             // Populate block IDs
             std::fill(&mergedGroupBlockIdx[(i * paddedPopSize) / blockSize], &mergedGroupBlockIdx[((i + 1) * paddedPopSize) / blockSize], i);
 
@@ -562,6 +673,7 @@ int main(int argc, char *argv[])
 
         // Copy merged group structures to symbols
         CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroups, &mergedGroups[0], sizeof(MergedPresynapticUpdateGroup) * NUM_POPULATIONS));
+        CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroups2, &mergedGroups2[0], sizeof(MergedPresynapticUpdateGroup2) * NUM_POPULATIONS));
         CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupBlockIdx, &mergedGroupBlockIdx[0], sizeof(unsigned int) * BLOCK_IDX_COUNT));
         
         // Naive tree-scan with host overallocated kernel launch
@@ -682,6 +794,28 @@ int main(int argc, char *argv[])
             float time;
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Overallocated:" << time << std::endl;
+            //checkOutput(correctInSyn, inSyn, popSize);
+        }
+        
+        // Overallocated version
+        {
+            // Copy overallocated group start IDs
+            CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupStartID, &overallocateMergedGroupStartID[0], sizeof(unsigned int) * NUM_POPULATIONS));
+
+            // Zero ISyn
+            zeroISyn(inSyn, popSize);
+
+            const unsigned int numBlocks = (paddedPopSize / blockSize) * NUM_POPULATIONS;
+            dim3 threads(blockSize, 1);
+            dim3 grid(numBlocks, 1);
+
+            CHECK_CUDA_ERRORS(cudaEventRecord(updateStart));
+            presynapticUpdateBitmask << <grid, threads >> > ();
+            CHECK_CUDA_ERRORS(cudaEventRecord(updateEnd));
+            CHECK_CUDA_ERRORS(cudaEventSynchronize(updateEnd));
+            float time;
+            CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
+            std::cout << "Batch bitmask:" << time << std::endl;
             //checkOutput(correctInSyn, inSyn, popSize);
         }
         
