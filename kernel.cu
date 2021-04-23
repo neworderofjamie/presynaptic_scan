@@ -30,8 +30,11 @@
 #define POP_SIZE POP_WIDTH * POP_HEIGHT * POP_CHANNELS
 #define KERNEL_SIZE 3
 #define BLOCK_IDX_COUNT 8192
-#define NUM_BATCHES 100
+#define NUM_BATCHES 32
 #define SEED 124
+
+#define BATCH_WORDS ((NUM_BATCHES + 31) / 32)
+
 
 #define CHECK_CUDA_ERRORS(call) {                                                                   \
     cudaError_t error = call;                                                                       \
@@ -131,8 +134,9 @@ __global__ void presynapticUpdateBitmask()
                                     outChan);
                 const unsigned int kernelInd = (kernRow * KERNEL_SIZE * POP_CHANNELS * POP_CHANNELS) + (kernCol * POP_CHANNELS * POP_CHANNELS) + (inChan * POP_CHANNELS) + (outChan);
                 const float weight = group->kernelg[kernelInd];
-                for(unsigned int w = 0; w < 4; w++) {
-                    uint32_t spikeWord = group->srcSpk[(preInd * 4) + w];
+                #pragma unroll
+                for(unsigned int w = 0; w < BATCH_WORDS; w++) {
+                    uint32_t spikeWord = group->srcSpk[(preInd * BATCH_WORDS) + w];
 
                     // While there any bits left
                     unsigned int ibit = 0;
@@ -614,7 +618,7 @@ int main(int argc, char *argv[])
             auto srcSpkCnt = allocateHostDevice<unsigned int>(NUM_BATCHES);
             auto srcSpk = allocateHostDevice<unsigned int>(popSize * NUM_BATCHES);
             auto kernelG = allocateHostDevice<float>(POP_CHANNELS * POP_CHANNELS * KERNEL_SIZE * KERNEL_SIZE);
-            auto spikeBitmask = allocateHostDevice<uint32_t>(batchWords * popSize);
+            auto spikeBitmask = allocateHostDevice<uint32_t>(popSize * BATCH_WORDS);
 
             // Zero spike bitmask
             std::fill_n(&spikeBitmask.first[0], popSize * batchWords, 0);
@@ -628,7 +632,7 @@ int main(int argc, char *argv[])
 
                     srcSpk.first[(b * popSize) + s] = idx;
 
-                    spikeBitmask.first[(idx * batchWords) + (b / 32)] |= (0x80000000 >> (b % 32));
+                    spikeBitmask.first[(idx * BATCH_WORDS) + (b / 32)] |= (0x80000000 >> (b % 32));
                 }
             }
             // Generate weights
@@ -797,7 +801,7 @@ int main(int argc, char *argv[])
             //checkOutput(correctInSyn, inSyn, popSize);
         }
         
-        // Overallocated version
+        // Bitmask version
         {
             // Copy overallocated group start IDs
             CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupStartID, &overallocateMergedGroupStartID[0], sizeof(unsigned int) * NUM_POPULATIONS));
