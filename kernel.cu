@@ -62,8 +62,8 @@ unsigned int mergedGroupBlockIdx[BLOCK_IDX_COUNT];
 MergedPresynapticUpdateGroup mergedGroups[NUM_POPULATIONS];
 
 // Device globals
-__device__ unsigned int d_max;
-__device__ unsigned int d_mergedGroupStartID[NUM_POPULATIONS];
+//__device__ unsigned int d_max;
+__device__ __constant__ unsigned int d_mergedGroupStartID[NUM_POPULATIONS];
 __device__ __constant__ MergedPresynapticUpdateGroup d_mergedGroups[NUM_POPULATIONS];
 __device__ __constant__ unsigned int d_mergedGroupBlockIdx[BLOCK_IDX_COUNT];
 
@@ -186,7 +186,7 @@ __global__ void presynapticUpdate()
         }
     }
 }
-
+/*
 // Presynaptic update kernel which reads max overall threads from global
  __global__ void presynapticUpdateMax()
 {
@@ -362,7 +362,7 @@ __global__ void treeScanWarpShuffle()
             d_max = paddedNumSpikes;
         }
     }
-}
+}*/
 
 template<unsigned int B>
 __global__ void matrixScanSM()
@@ -565,7 +565,7 @@ int main(int argc, char *argv[])
         CHECK_CUDA_ERRORS(cudaMemcpyToSymbol(d_mergedGroupBlockIdx, &mergedGroupBlockIdx[0], sizeof(unsigned int) * BLOCK_IDX_COUNT));
         
         // Naive tree-scan with host overallocated kernel launch
-        {
+        /*{
             // Zero ISyn
             zeroISyn(inSyn, popSize);
 
@@ -639,7 +639,7 @@ int main(int argc, char *argv[])
             CHECK_CUDA_ERRORS(cudaEventElapsedTime(&time, updateStart, updateEnd));
             std::cout << "Tree scan warp shuffle dynamic parallelism:" << time << std::endl;
             //checkOutput(correctInSyn, inSyn, popSize);
-        }
+        }*/
 
         // Oracle version with perfectly sized groups and kernel
         {
